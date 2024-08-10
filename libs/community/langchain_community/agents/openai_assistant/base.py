@@ -320,7 +320,7 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
                         {
                             "role": "user",
                             "content": input["content"],
-                            "attachments": attachments,
+                            # "attachments": attachments,
                             "metadata": input.get("message_metadata"),
                         }
                     ],
