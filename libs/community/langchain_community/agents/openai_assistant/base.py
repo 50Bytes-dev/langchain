@@ -5,13 +5,18 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     Optional,
     Sequence,
     Type,
     Union,
 )
 
-from langchain.agents.openai_assistant.base import OpenAIAssistantRunnable, OutputType
+from langchain.agents.openai_assistant.base import (
+    OpenAIAssistantFinish,
+    OpenAIAssistantRunnable,
+    OutputType,
+)
 from langchain_core._api import beta
 from langchain_core.callbacks import CallbackManager
 from langchain_core.load import dumpd
@@ -19,11 +24,25 @@ from langchain_core.pydantic_v1 import BaseModel, Field, root_validator
 from langchain_core.runnables import RunnableConfig, ensure_config
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.runnables.utils import Input, Output
 
 if TYPE_CHECKING:
     import openai
     from openai._types import NotGiven
     from openai.types.beta.assistant import ToolResources as AssistantToolResources
+    from openai.types.beta.assistant_stream_event import (
+        AssistantStreamEvent,
+        ThreadRunCreated,
+        ThreadMessageDelta,
+        ThreadMessageCompleted,
+        ThreadRunCompleted,
+        ThreadRunQueued,
+        ThreadRunInProgress,
+        ThreadRunStepCreated,
+        ThreadRunStepCompleted,
+        ThreadMessageInProgress,
+        ThreadMessageCreated,
+    )
 
 
 def _get_openai_client() -> openai.OpenAI:
@@ -354,6 +373,95 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
             run_manager.on_chain_end(response)
             return response
 
+    def stream(
+        self,
+        input: Input,
+        config: Optional[RunnableConfig] = None,
+        **kwargs: Optional[Any],
+    ) -> Iterator[Output]:
+        """
+        Default implementation of stream, which calls invoke.
+        Subclasses should override this method if they support streaming output.
+
+        Args:
+            input: The input to the Runnable.
+            config: The config to use for the Runnable. Defaults to None.
+            kwargs: Additional keyword arguments to pass to the Runnable.
+
+        Yields:
+            The output of the Runnable.
+        """
+        config = ensure_config(config)
+        callback_manager = CallbackManager.configure(
+            inheritable_callbacks=config.get("callbacks"),
+            inheritable_tags=config.get("tags"),
+            inheritable_metadata=config.get("metadata"),
+        )
+        run_manager = callback_manager.on_chain_start(
+            dumpd(self), input, name=config.get("run_name")
+        )
+
+        files = _convert_file_ids_into_attachments(kwargs.get("file_ids", []))
+        attachments = kwargs.get("attachments", []) + files
+
+        try:
+            # Being run within AgentExecutor and there are tool outputs to submit.
+            if self.as_agent and input.get("intermediate_steps"):
+                raise NotImplementedError("intermediate_steps")
+            # Starting a new thread and a new run.
+            elif "thread_id" not in input:
+                raise NotImplementedError("thread_id not in input")
+            # Starting a new run in an existing thread.
+            elif "run_id" not in input:
+                _ = self.client.beta.threads.messages.create(
+                    input["thread_id"],
+                    content=input["content"],
+                    role="user",
+                    attachments=attachments,
+                    metadata=input.get("message_metadata"),
+                )
+                stream = self._create_stream(input)
+            # Submitting tool outputs to an existing run, outside the AgentExecutor
+            # framework.
+            else:
+                raise NotImplementedError("submit_tool_outputs")
+
+            # run = self._wait_for_run(run.id, run.thread_id)
+            with stream as events:
+                for event in events:
+                    event: AssistantStreamEvent
+                    # ThreadRunCreated
+                    # ThreadRunQueued
+                    # ThreadRunInProgress
+                    # ThreadRunStepCreated
+                    # ThreadMessageCreated
+                    # ThreadMessageInProgress
+                    # ThreadMessageDelta (здесь можно получить чанки текста)
+                    # ThreadMessageCompleted
+                    # ThreadRunStepCompleted
+                    # ThreadRunCompleted
+                    # print(event)
+                    if event.event == "thread.message.delta":
+                        event: ThreadMessageDelta
+                        chunk = event.data.delta.content[0].text.value
+                        run_manager.on_text(chunk)
+                    if event.event == "thread.run.completed":
+                        event: ThreadRunCompleted
+                        run = event.data
+
+        except BaseException as e:
+            run_manager.on_chain_error(e)
+            raise e
+
+        try:
+            response = self._get_response(run)
+        except BaseException as e:
+            run_manager.on_chain_error(e, metadata=run.dict())
+            raise e
+        else:
+            run_manager.on_chain_end(response)
+            yield response
+
     @classmethod
     async def acreate_assistant(
         cls,
@@ -498,11 +606,41 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
         params = {
             k: v
             for k, v in input.items()
-            if k in ("instructions", "model", "tools", "tool_resources", "run_metadata")
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "tool_resources",
+                "run_metadata",
+                "response_format",
+            )
         }
+
         return self.client.beta.threads.runs.create(
             input["thread_id"],
             assistant_id=self.assistant_id,
+            **params,
+        )
+
+    def _create_stream(self, input: dict) -> Any:
+        params = {
+            k: v
+            for k, v in input.items()
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "tool_resources",
+                "run_metadata",
+                "response_format",
+            )
+        }
+
+        return self.client.beta.threads.runs.stream(
+            assistant_id=self.assistant_id,
+            thread_id=input["thread_id"],
             **params,
         )
 
@@ -510,7 +648,15 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
         params = {
             k: v
             for k, v in input.items()
-            if k in ("instructions", "model", "tools", "run_metadata")
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "tool_resources",
+                "run_metadata",
+                "response_format",
+            )
         }
         if tool_resources := input.get("tool_resources"):
             thread["tool_resources"] = tool_resources
@@ -525,7 +671,14 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
         params = {
             k: v
             for k, v in input.items()
-            if k in ("instructions", "model", "tools", "tool_resources" "run_metadata")
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "tool_resources" "run_metadata",
+                "response_format",
+            )
         }
         return await self.async_client.beta.threads.runs.create(
             input["thread_id"],
@@ -537,7 +690,14 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
         params = {
             k: v
             for k, v in input.items()
-            if k in ("instructions", "model", "tools", "run_metadata")
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "run_metadata",
+                "response_format",
+            )
         }
         if tool_resources := input.get("tool_resources"):
             thread["tool_resources"] = tool_resources
