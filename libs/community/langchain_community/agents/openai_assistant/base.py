@@ -407,10 +407,26 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
         try:
             # Being run within AgentExecutor and there are tool outputs to submit.
             if self.as_agent and input.get("intermediate_steps"):
-                raise NotImplementedError("intermediate_steps")
+                tool_outputs = self._parse_intermediate_steps(
+                    input["intermediate_steps"]
+                )
+                stream = self.client.beta.threads.runs.submit_tool_outputs_stream(
+                    **tool_outputs
+                )
             # Starting a new thread and a new run.
             elif "thread_id" not in input:
-                raise NotImplementedError("thread_id not in input")
+                thread = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": input["content"],
+                            # "attachments": attachments,
+                            "metadata": input.get("message_metadata"),
+                        }
+                    ],
+                    "metadata": input.get("thread_metadata"),
+                }
+                stream = self._create_thread_and_stream(input, thread)
             # Starting a new run in an existing thread.
             elif "run_id" not in input:
                 _ = self.client.beta.threads.messages.create(
@@ -424,7 +440,9 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
             # Submitting tool outputs to an existing run, outside the AgentExecutor
             # framework.
             else:
-                raise NotImplementedError("submit_tool_outputs")
+                stream = self.client.beta.threads.runs.submit_tool_outputs_stream(
+                    **input
+                )
 
             # run = self._wait_for_run(run.id, run.thread_id)
             with stream as events:
@@ -445,8 +463,10 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
                         event: ThreadMessageDelta
                         chunk = event.data.delta.content[0].text.value
                         run_manager.on_text(chunk)
-                    if event.event == "thread.run.completed":
-                        event: ThreadRunCompleted
+                    if event.event in [
+                        "thread.run.completed",
+                        "thread.run.requires_action",
+                    ]:
                         run = event.data
 
         except BaseException as e:
@@ -666,6 +686,29 @@ class OpenAIAssistantV2Runnable(OpenAIAssistantRunnable):
             **params,
         )
         return run
+
+    def _create_thread_and_stream(self, input: dict, thread: dict):
+        params = {
+            k: v
+            for k, v in input.items()
+            if k
+            in (
+                "instructions",
+                "model",
+                "tools",
+                "tool_resources",
+                "run_metadata",
+                "response_format",
+            )
+        }
+        if tool_resources := input.get("tool_resources"):
+            thread["tool_resources"] = tool_resources
+        stream = self.client.beta.threads.create_and_run_stream(
+            assistant_id=self.assistant_id,
+            thread=thread,
+            **params,
+        )
+        return stream
 
     async def _acreate_run(self, input: dict) -> Any:
         params = {
